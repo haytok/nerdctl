@@ -1,0 +1,178 @@
+name: repro-issue-13254
+
+# Standalone workflow to reproduce containerd/containerd#13254
+# (TestListHyperVContainer regression in containerd v2.3.0-beta.2).
+# Manual trigger only. Runs only TestListHyperVContainer on a single
+# Windows runner so the run is short and cheap. Use the input to switch
+# containerd version (e.g. 2.3.0-beta.1 = pass, 2.3.0-beta.2 = fail).
+
+on:
+  workflow_dispatch:
+    inputs:
+      containerd-version:
+        description: "containerd version (e.g. 2.3.0-beta.1, 2.3.0-beta.2)"
+        required: true
+        default: "2.3.0-beta.2"
+        type: string
+      runner:
+        description: "Windows runner"
+        required: true
+        default: "windows-2022"
+        type: choice
+        options:
+          - windows-2022
+          - windows-2025
+      hcsshim-version:
+        description: "Override hcsshim shim with this git ref (tag, branch, or commit SHA). Empty = use the one bundled with containerd."
+        required: false
+        default: ""
+        type: string
+      hcsshim-repo:
+        description: "Clone hcsshim from this URL instead of microsoft/hcsshim (only used when hcsshim-version is set)."
+        required: false
+        default: "https://github.com/microsoft/hcsshim.git"
+        type: string
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  repro:
+    name: "TestListHyperVContainer @ containerd ${{ inputs.containerd-version }} on ${{ inputs.runner }}"
+    timeout-minutes: 30
+    runs-on: ${{ inputs.runner }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: "Install Go"
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: 1.26
+          check-latest: true
+
+      - name: "Install WinCNI"
+        run: |
+          GOPATH=$(go env GOPATH) WINCNI_VERSION=v0.3.1 ./hack/provisioning/windows/cni.sh
+
+      - name: "Install containerd ${{ inputs.containerd-version }}"
+        env:
+          ctrdVersion: ${{ inputs.containerd-version }}
+        run: |
+          powershell hack/provisioning/windows/containerd.ps1
+
+      - name: "Override hcsshim shim @ ${{ inputs.hcsshim-version }}"
+        if: ${{ inputs.hcsshim-version != '' }}
+        shell: powershell
+        run: |
+          $ref = "${{ inputs.hcsshim-version }}"
+          $repo = "${{ inputs.hcsshim-repo }}"
+          Write-Host "=== Cloning hcsshim from $repo ==="
+          git clone $repo "$Env:RUNNER_TEMP\hcsshim"
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+
+          Push-Location "$Env:RUNNER_TEMP\hcsshim"
+          try {
+            Write-Host "=== Checking out $ref ==="
+            git checkout $ref
+            if ($LASTEXITCODE -ne 0) { throw "git checkout $ref failed" }
+
+            Write-Host "=== Building containerd-shim-runhcs-v1.exe from hcsshim $ref ==="
+            go build -o "$Env:RUNNER_TEMP\containerd-shim-runhcs-v1.exe" ./cmd/containerd-shim-runhcs-v1
+            if ($LASTEXITCODE -ne 0) { throw "go build failed" }
+          } finally {
+            Pop-Location
+          }
+
+          Write-Host "=== Stopping containerd to release shim file lock ==="
+          Stop-Service containerd
+          Start-Sleep -Seconds 2
+
+          $dst = "$Env:ProgramFiles\containerd\containerd-shim-runhcs-v1.exe"
+          Write-Host "=== Replacing $dst ==="
+          Copy-Item -Path "$Env:RUNNER_TEMP\containerd-shim-runhcs-v1.exe" -Destination $dst -Force
+
+          Write-Host "=== File info after replace ==="
+          Get-Item $dst | Format-List Name, Length, LastWriteTime
+          # Module version stamp from go build
+          & go version -m $dst | Select-String -Pattern "github.com/Microsoft/hcsshim|^\s*mod\s"
+
+          Start-Service containerd
+          Start-Sleep -Seconds 3
+          Get-Service containerd
+
+      - name: "Enable containerd debug logging"
+        shell: powershell
+        run: |
+          $config = "$Env:ProgramFiles\containerd\config.toml"
+          $content = Get-Content $config -Raw
+          if ($content -match '(?m)^\[debug\]') {
+            $content = $content -replace '(?m)^(\s*level\s*=).*$', '$1 "debug"'
+          } else {
+            $content += "`n[debug]`n  level = `"debug`"`n"
+          }
+          Set-Content -Path $config -Value $content -Encoding ascii
+          Write-Host "=== containerd config.toml ==="
+          Get-Content $config
+          Restart-Service containerd
+          Start-Sleep -Seconds 3
+          Get-Service containerd
+
+      - name: "Build and install nerdctl"
+        run: |
+          go install ./cmd/nerdctl
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: "Install dev tools"
+        run: |
+          make install-dev-tools
+
+      - name: "Print versions"
+        run: |
+          go version
+          "/c/Program Files/containerd/containerd.exe" --version
+          nerdctl --version
+          echo "=== hcsshim version embedded in shim binary ==="
+          go version -m "/c/Program Files/containerd/containerd-shim-runhcs-v1.exe" \
+            | grep -E "github.com/Microsoft/hcsshim|^\s+mod\s" || true
+
+      - name: "Run TestListHyperVContainer (verbose)"
+        run: |
+          go test -v -timeout 30m \
+            -run '^TestListHyperVContainer$' \
+            ./cmd/nerdctl/container/... \
+            -args -test.allow-kill-daemon -test.only-flaky=true
+
+      - name: "Collect diagnostics"
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "=== bridge-debug.log (full content) ==="
+          if (Test-Path "C:\bridge-debug.log") {
+            Get-Content "C:\bridge-debug.log"
+          } else {
+            Write-Host "(no C:\bridge-debug.log found)"
+          }
+          Write-Host "`n=== containerd service ==="
+          Get-Service containerd | Format-List
+          Write-Host "`n=== containerd config.toml ==="
+          Get-Content "$Env:ProgramFiles\containerd\config.toml"
+          Write-Host "`n=== containerd Application event log (last 200) ==="
+          Get-EventLog -LogName Application -Source containerd -Newest 200 -ErrorAction SilentlyContinue |
+            Format-List TimeGenerated, EntryType, Message
+          Write-Host "`n=== Hyper-V-Compute Operational (last 200) ==="
+          Get-WinEvent -LogName Microsoft-Windows-Hyper-V-Compute-Operational -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, LevelDisplayName, Message
+          Write-Host "`n=== Hyper-V-Worker Admin (last 200) ==="
+          Get-WinEvent -LogName Microsoft-Windows-Hyper-V-Worker-Admin -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, LevelDisplayName, Message
+          Write-Host "`n=== nerdctl info ==="
+          & "$(go env GOPATH)\bin\nerdctl.exe" info 2>&1
+          Write-Host "`n=== running containers ==="
+          & "$(go env GOPATH)\bin\nerdctl.exe" --namespace=nerdctl-test ps -a 2>&1
