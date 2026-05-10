@@ -15,6 +15,10 @@ on:
         required: false
         default: false
         type: boolean
+      no-hyperv:
+        required: false
+        default: false
+        type: boolean
       binary:
         required: false
         default: nerdctl
@@ -25,13 +29,19 @@ on:
       docker-version:
         required: true
         type: string
-      containerd-version:
+      windows-containerd-version:
         required: true
         type: string
-      containerd-sha:
+      windows-containerd-sha:
         required: true
         type: string
-      containerd-service-sha:
+      linux-containerd-version:
+        required: true
+        type: string
+      linux-containerd-sha:
+        required: true
+        type: string
+      linux-containerd-service-sha:
         required: true
         type: string
       windows-cni-version:
@@ -66,14 +76,21 @@ jobs:
       GO_VERSION: ${{ inputs.go-version }}
       # Both Docker and nerdctl on linux need rootful right now
       WITH_SUDO: ${{ contains(inputs.runner, 'ubuntu') }}
-      CONTAINERD_VERSION: ${{ inputs.containerd-version }}
-      CONTAINERD_SHA: ${{ inputs.containerd-sha }}
+      WINDOWS_CONTAINERD_VERSION: ${{ inputs.windows-containerd-version }}
+      WINDOWS_CONTAINERD_SHA: ${{ inputs.windows-containerd-sha }}
+      LINUX_CONTAINERD_VERSION: ${{ inputs.linux-containerd-version }}
+      LINUX_CONTAINERD_SHA: ${{ inputs.linux-containerd-sha }}
 
     steps:
       - name: "Init: checkout"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 1
+
+      - if: ${{ inputs.no-hyperv }}
+        name: "Init (no-hyperv): Disable Hyper-V"
+        run: |
+          printf "NO_HYPERV=1\n" >> "$GITHUB_ENV"
 
       - if: ${{ inputs.canary }}
         name: "Init (canary): retrieve latest go and containerd"
@@ -85,11 +102,22 @@ jobs:
 
           [ "$latest_go" == "" ] || \
             printf "GO_VERSION=%s\n" "$latest_go" >> "$GITHUB_ENV"
-          [ "${latest_containerd:1}" == "$CONTAINERD_VERSION" ] || {
-            printf "CONTAINERD_VERSION=%s\n" "${latest_containerd:1}" >> "$GITHUB_ENV"
-            printf "CONTAINERD_SHA=canary is volatile and I accept the risk\n" >> "$GITHUB_ENV"
+
+          if [[ "${{ inputs.runner }}" == *windows* ]]; then
+            containerd_version="$WINDOWS_CONTAINERD_VERSION"
+          else
+            containerd_version="$LINUX_CONTAINERD_VERSION"
+          fi
+          [ "${latest_containerd:1}" == "$containerd_version" ] || {
+            if [[ "${{ inputs.runner }}" == *windows* ]]; then
+              printf "WINDOWS_CONTAINERD_VERSION=%s\n" "${latest_containerd:1}" >> "$GITHUB_ENV"
+              printf "WINDOWS_CONTAINERD_SHA=canary is volatile and I accept the risk\n" >> "$GITHUB_ENV"
+            else
+              printf "LINUX_CONTAINERD_VERSION=%s\n" "${latest_containerd:1}" >> "$GITHUB_ENV"
+              printf "LINUX_CONTAINERD_SHA=canary is volatile and I accept the risk\n" >> "$GITHUB_ENV"
+            fi
           }
-          if [ "$latest_go" == "" ] && [ "${latest_containerd:1}" == "$CONTAINERD_VERSION" ]; then
+          if [ "$latest_go" == "" ] && [ "${latest_containerd:1}" == "$containerd_version" ]; then
             echo "::warning title=No canary::There is currently no canary versions to test. Steps will not run.";
             printf "SHOULD_RUN=no\n" >> "$GITHUB_ENV"
           fi
@@ -128,7 +156,7 @@ jobs:
             # FIXME: this is missing runc (see top level workflow note about the state of this)
             echo "::group:: install dependencies"
             sudo ./hack/provisioning/linux/containerd.sh uninstall
-            ./hack/provisioning/linux/containerd.sh rootful "$CONTAINERD_VERSION" "amd64" "$CONTAINERD_SHA" "${{ inputs.containerd-service-sha }}"
+            ./hack/provisioning/linux/containerd.sh rootful "$LINUX_CONTAINERD_VERSION" "amd64" "$LINUX_CONTAINERD_SHA" "${{ inputs.linux-containerd-service-sha }}"
             sudo ./hack/provisioning/linux/cni.sh uninstall
             ./hack/provisioning/linux/cni.sh install "${{ inputs.linux-cni-version }}" "amd64" "${{ inputs.linux-cni-sha }}"
             echo "::endgroup::"
@@ -164,7 +192,8 @@ jobs:
       - if: ${{ contains(inputs.runner, 'windows') && env.SHOULD_RUN == 'yes' }}
         name: "Init (windows): prepare host"
         env:
-          ctrdVersion: ${{ env.CONTAINERD_VERSION }}
+          ctrdVersion: ${{ env.WINDOWS_CONTAINERD_VERSION }}
+          ctrdSha: ${{ env.WINDOWS_CONTAINERD_SHA }}
         run: |
           # Install WinCNI
           echo "::group:: install wincni"
