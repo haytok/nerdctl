@@ -34,6 +34,10 @@ if [[ "$(id -u)" = "0" ]]; then
 	systemctl start ssh
 	exec ssh -o StrictHostKeyChecking=no rootless@localhost "$0" "$@"
 else
+	mkdir -p "/home/rootless/.config/containerd"
+	echo 'version = 2' > "/home/rootless/.config/containerd/config.toml"
+	echo 'disabled_plugins = ["io.containerd.grpc.v1.cri"]' >> "/home/rootless/.config/containerd/config.toml"
+
 	containerd-rootless-setuptool.sh install
 	if grep -q "options use-vc" /etc/resolv.conf; then
 		containerd-rootless-setuptool.sh nsenter -- sh -euc 'echo "options use-vc" >>/etc/resolv.conf'
