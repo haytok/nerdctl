@@ -152,10 +152,10 @@ Usage: `nerdctl run [OPTIONS] IMAGE [COMMAND] [ARG...]`
 Basic flags:
 
 - :whale: `-a, --attach`: Attach STDIN, STDOUT, or STDERR
-- :whale: `-i, --interactive`: Keep STDIN open even if not attached"
+- :whale: `-i, --interactive`: Keep STDIN open even if not attached
 - :whale: `-t, --tty`: Allocate a pseudo-TTY
   - :warning: WIP: currently `-t` conflicts with `-d`
-- :whale: `-sig-proxy`: Proxy received signals to the process (default true)
+- :whale: `--sig-proxy`: Proxy received signals to the process (default true)
 - :whale: `-d, --detach`: Run container in background and print container ID
 - :whale: `--restart=(no|always|on-failure|unless-stopped)`: Restart policy to apply when a container exits
   - Default: "no"
